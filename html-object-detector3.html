@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Détecteur d'objets WebGPU & Audio Continu</title>
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort.webgpu.min.js"></script>
+  <style>
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #111;
+      color: #fff;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 10px;
+    }
+    #container {
+      position: relative;
+      width: 100%;
+      max-width: 640px;
+      margin-top: 10px;
+    }
+    video, canvas {
+      width: 100%;
+      height: auto;
+      border-radius: 8px;
+      display: block;
+    }
+    canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+    }
+    #stats {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      background: rgba(0, 0, 0, 0.7);
+      padding: 6px 12px;
+      border-radius: 4px;
+      color: #00ff66;
+      font-family: monospace;
+      font-size: 14px;
+    }
+    .controls {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    button, input[type="file"] {
+      padding: 10px 18px;
+      font-size: 15px;
+      font-weight: bold;
+      border: none;
+      background: #2563eb;
+      color: white;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    input[type="file"] {
+      background: #333;
+    }
+  </style>
+</head>
+<body>
+
+  <h2>Détection d'objets & Audio Continu (WebGPU)</h2>
+
+  <div class="controls">
+    <label for="model-file">1. Sélectionner le modèle local (.onnx) :</label>
+    <input type="file" id="model-file" accept=".onnx">
+    <button id="start-btn" disabled>2. Démarrer la caméra</button>
+  </div>
+
+  <div id="container">
+    <video id="webcam" autoplay playsinline muted></video>
+    <canvas id="output"></canvas>
+    <div id="stats">Statut : Veuillez charger le fichier modèle</div>
+  </div>
+
+  <script>
+    const TARGET_CLASSES = {
+      0: 'Personne',
+      56: 'Chaise',
+      57: 'Canapé',
+      59: 'Lit',
+      60: 'Table'
+    };
+
+    const CLASS_WAVEFORMS = {
+      0: 'sine',
+      56: 'triangle',
+      57: 'sawtooth',
+      59: 'sawtooth',
+      60: 'square'
+    };
+
+    const CONF_THRESHOLD = 0.4;
+    const IOU_THRESHOLD = 0.45;
+    const MODEL_SIZE = 640;
+    const MAX_AUDIO_OBJECTS = 4;
+
+    let session = null;
+    const video = document.getElementById('webcam');
+    const canvas = document.getElementById('output');
+    const ctx = canvas.getContext('2d');
+    const statsDiv = document.getElementById('stats');
+    const startBtn = document.getElementById('start-btn');
+    const fileInput = document.getElementById('model-file');
+    let lastFrameTime = performance.now();
+
+    // -------------------------------------------------------------------
+    // MOTEUR AUDIO CONTINU (Web Audio API avec transitions douces)
+    // -------------------------------------------------------------------
+    class ContinuousSoundEngine {
+      constructor() {
+        this.ctx = null;
+        this.voices = [];
+      }
+
+      init() {
+        if (!this.ctx) {
+          this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (this.ctx.state === 'suspended') {
+          this.ctx.resume();
+        }
+
+        // Pré-création des voix fixes
+        while (this.voices.length < MAX_AUDIO_OBJECTS) {
+          this.voices.push(this.createVoice());
+        }
+      }
+
+      createVoice() {
+        const osc = this.ctx.createOscillator();
+        const panner = this.ctx.createStereoPanner();
+        const gain = this.ctx.createGain();
+
+        // Volume initial à zéro pour éviter les clics au démarrage
+        gain.gain.setValueAtTime(0, this.ctx.currentTime);
+
+        osc.connect(panner);
+        panner.connect(gain);
+        gain.connect(this.ctx.destination);
+
+        osc.start();
+
+        return { osc, panner, gain, currentWave: 'sine' };
+      }
+
+      update(objects, imgWidth, imgHeight) {
+        if (!this.ctx) return;
+
+        const now = this.ctx.currentTime;
+        // Constante de temps pour le lissage (50ms) : évite le son haché
+        const timeConstant = 0.05;
+
+        const sortedObjects = [...objects]
+          .sort((a, b) => b.score - a.score)
+          .slice(0, MAX_AUDIO_OBJECTS);
+
+        // Mise à jour des voix actives
+        sortedObjects.forEach((obj, idx) => {
+          const voice = this.voices[idx];
+          const [x, y, w, h] = obj.box;
+
+          // 1. Panoramique X (-1 à 1)
+          const centerX = x + w / 2;
+          const pan = Math.max(-1, Math.min(1, ((centerX / imgWidth) * 2) - 1));
+
+          // 2. Fréquence Y (200 Hz à 2000 Hz)
+          const centerY = y + h / 2;
+          const normalizedY = 1 - (centerY / imgHeight);
+          const freq = 200 + Math.pow(normalizedY, 2) * 1800;
+
+          // 3. Surface -> Gain
+          const areaRatio = (w * h) / (imgWidth * imgHeight);
+          const targetGain = Math.min(0.2, 0.03 + areaRatio * 0.35);
+
+          const waveType = CLASS_WAVEFORMS[obj.classId] || 'sine';
+          if (voice.currentWave !== waveType) {
+            voice.osc.type = waveType;
+            voice.currentWave = waveType;
+          }
+
+          // Application progressive des paramètres (Interpolation)
+          voice.osc.frequency.setTargetAtTime(freq, now, timeConstant);
+          voice.panner.pan.setTargetAtTime(pan, now, timeConstant);
+          voice.gain.gain.setTargetAtTime(targetGain, now, timeConstant);
+        });
+
+        // Extinction progressive des voix inutilisées
+        for (let i = sortedObjects.length; i < MAX_AUDIO_OBJECTS; i++) {
+          const voice = this.voices[i];
+          voice.gain.gain.setTargetAtTime(0, now, timeConstant);
+        }
+      }
+    }
+
+    const audioEngine = new ContinuousSoundEngine();
+
+    // -------------------------------------------------------------------
+    // CHARGEMENT DU MODÈLE ONNX (WEB GPU)
+    // -------------------------------------------------------------------
+    fileInput.addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      statsDiv.innerText = "Chargement du modèle...";
+      try {
+        const buffer = await file.arrayBuffer();
+        // Utilisation prioritaire de WebGPU pour des performances proches de Python
+        session = await ort.InferenceSession.create(buffer, {
+          executionProviders: ['webgpu', 'wasm']
+        });
+        statsDiv.innerText = "Modèle prêt (WebGPU) ! Cliquer sur Démarrer.";
+        startBtn.disabled = false;
+      } catch (error) {
+        console.error(error);
+        statsDiv.innerText = `Erreur : ${error.message}`;
+      }
+    });
+
+    startBtn.addEventListener('click', async () => {
+      audioEngine.init();
+      if (!session) return;
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false
+      });
+      video.srcObject = stream;
+
+      video.onloadedmetadata = () => {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        requestAnimationFrame(detectFrame);
+      };
+    });
+
+    function preprocess(videoElement) {
+      const tempCanvas = document.createElement('canvas');
+      tempCanvas.width = MODEL_SIZE;
+      tempCanvas.height = MODEL_SIZE;
+      const tempCtx = tempCanvas.getContext('2d');
+      tempCtx.drawImage(videoElement, 0, 0, MODEL_SIZE, MODEL_SIZE);
+
+      const { data } = tempCtx.getImageData(0, 0, MODEL_SIZE, MODEL_SIZE);
+      const float32Data = new Float32Array(3 * MODEL_SIZE * MODEL_SIZE);
+
+      for (let i = 0; i < MODEL_SIZE * MODEL_SIZE; i++) {
+        float32Data[i] = data[i * 4] / 255.0;
+        float32Data[i + MODEL_SIZE * MODEL_SIZE] = data[i * 4 + 1] / 255.0;
+        float32Data[2 * MODEL_SIZE * MODEL_SIZE + i] = data[i * 4 + 2] / 255.0;
+      }
+
+      return new ort.Tensor('float32', float32Data, [1, 3, MODEL_SIZE, MODEL_SIZE]);
+    }
+
+    async function detectFrame() {
+      const now = performance.now();
+      const fps = Math.round(1000 / (now - lastFrameTime));
+      lastFrameTime = now;
+      statsDiv.innerText = `FPS : ${fps}`;
+
+      const tensor = preprocess(video);
+      const results = await session.run({ images: tensor });
+      const output = results[Object.keys(results)[0]].data;
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      postprocess(output, canvas.width, canvas.height);
+
+      requestAnimationFrame(detectFrame);
+    }
+
+    function iou(box1, box2) {
+      const x1 = Math.max(box1[0], box2[0]);
+      const y1 = Math.max(box1[1], box2[1]);
+      const x2 = Math.min(box1[0] + box1[2], box2[0] + box2[2]);
+      const y2 = Math.min(box1[1] + box1[3], box2[1] + box2[3]);
+      const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+      const union = box1[2] * box1[3] + box2[2] * box2[3] - inter;
+      return inter / union;
+    }
+
+    function nms(boxes) {
+      boxes.sort((a, b) => b.score - a.score);
+      const result = [];
+      while (boxes.length > 0) {
+        const current = boxes.shift();
+        result.push(current);
+        boxes = boxes.filter(box => iou(current.box, box.box) < IOU_THRESHOLD);
+      }
+      return result;
+    }
+
+    function postprocess(output, imgWidth, imgHeight) {
+      const numAnchors = 8400;
+      const scaleX = imgWidth / MODEL_SIZE;
+      const scaleY = imgHeight / MODEL_SIZE;
+      const candidates = [];
+
+      for (let i = 0; i < numAnchors; i++) {
+        let maxProb = 0;
+        let classId = -1;
+
+        for (const targetId in TARGET_CLASSES) {
+          const prob = output[(4 + parseInt(targetId)) * numAnchors + i];
+          if (prob > maxProb) {
+            maxProb = prob;
+            classId = parseInt(targetId);
+          }
+        }
+
+        if (maxProb >= CONF_THRESHOLD) {
+          const cx = output[0 * numAnchors + i] * scaleX;
+          const cy = output[1 * numAnchors + i] * scaleY;
+          const w = output[2 * numAnchors + i] * scaleX;
+          const h = output[3 * numAnchors + i] * scaleY;
+
+          candidates.push({
+            box: [cx - w / 2, cy - h / 2, w, h],
+            score: maxProb,
+            classId: classId
+          });
+        }
+      }
+
+      const filtered = nms(candidates);
+
+      // Mise à jour fluide du son sans bloquer le rendu
+      audioEngine.update(filtered, imgWidth, imgHeight);
+
+      filtered.forEach(item => {
+        const [x, y, w, h] = item.box;
+        ctx.strokeStyle = '#00FF66';
+        ctx.lineWidth = 3;
+        ctx.strokeRect(x, y, w, h);
+
+        ctx.fillStyle = '#00FF66';
+        ctx.font = '16px sans-serif';
+        const label = `${TARGET_CLASSES[item.classId]} ${Math.round(item.score * 100)}%`;
+        ctx.fillText(label, x, y > 15 ? y - 5 : 15);
+      });
+    }
+  </script>
+</body>
+</html>
